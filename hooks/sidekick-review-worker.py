@@ -25,7 +25,7 @@ def proj_dir(cwd: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-DEFAULT_MODEL = os.environ.get("SIDEKICK_MODEL", "gpt-5")  # Full GPT-5 model with high reasoning
+DEFAULT_MODEL = os.environ.get("SIDEKICK_MODEL", "gpt-4-turbo-preview")  # GPT-4 Turbo for code review
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")          # required for API mode
 API_URL = os.environ.get("SIDEKICK_API_URL", "https://api.openai.com/v1/chat/completions")
 
@@ -180,7 +180,6 @@ def call_openai(model: str, system_prompt: str, user_payload: str, timeout=40):
     body = {
         "model": model,
         "temperature": 0.2,
-        "reasoning_effort": "high",  # Use GPT-5's high reasoning mode for better analysis
         "messages": [
             {"role":"system","content": system_prompt},
             {"role":"user","content": user_payload}
