@@ -32,7 +32,7 @@ API_URL = os.environ.get("SIDEKICK_API_URL", "https://api.openai.com/v1/chat/com
 MAX_EVENTS = int(os.environ.get("SIDEKICK_MAX_EVENTS", "60"))   # last N messages to inspect
 MAX_LINES_TOTAL = int(os.environ.get("SIDEKICK_MAX_LINES_TOTAL", "1200"))  # total line cap
 MAX_BLOCK_LINES = int(os.environ.get("SIDEKICK_MAX_BLOCK_LINES", "500"))   # cap for code blocks
-THRESHOLD  = float(os.environ.get("SIDEKICK_THRESHOLD", "0.2")) # score gate - lowered for more frequent nudges
+THRESHOLD  = float(os.environ.get("SIDEKICK_THRESHOLD", "0")) # score gate - always show nudges
 NUDGE_TTL  = int(os.environ.get("SIDEKICK_NUDGE_TTL_SECONDS", "900"))
 
 def load_json(path, default):
