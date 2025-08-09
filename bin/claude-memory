@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+View and manage Claude sidekick memory for the current project.
+"""
+
+import json, sys, os, hashlib
+from pathlib import Path
+from datetime import datetime
+
+def proj_slug(cwd: str) -> str:
+    """Generate stable slug for project path"""
+    return hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:12]
+
+def format_memory(memory: dict) -> str:
+    """Format memory for display"""
+    output = []
+    
+    # Header
+    output.append("=" * 60)
+    output.append("CLAUDE SIDEKICK MEMORY")
+    output.append("=" * 60)
+    
+    # Basic stats
+    sessions = memory.get("sessions", 0)
+    last_updated = memory.get("last_updated", "never")
+    output.append(f"\nSessions: {sessions}")
+    output.append(f"Last updated: {last_updated}")
+    
+    # Project context
+    if memory.get("project_context"):
+        ctx = memory["project_context"]
+        output.append(f"\nProject Type: {ctx.get('project_type', 'unknown')}")
+        output.append(f"Languages: {', '.join(ctx.get('languages', []))}")
+        output.append(f"Has Tests: {ctx.get('has_tests', False)}")
+    
+    # Git context
+    if memory.get("git_context"):
+        git = memory["git_context"]
+        output.append(f"\nGit Branch: {git.get('branch', 'unknown')}")
+        output.append(f"Uncommitted changes: {git.get('uncommitted_changes', 0)}")
+        output.append(f"Commit frequency: {git.get('commit_frequency', 'unknown')}")
+        
+        if git.get("recent_commits"):
+            output.append("\nRecent commits:")
+            for commit in git["recent_commits"][:5]:
+                output.append(f"  - {commit[:80]}")
+    
+    # Conversation summary
+    if memory.get("conversation_summary"):
+        summary = memory["conversation_summary"]
+        if summary.get("recent"):
+            output.append(f"\nRecent activity:\n{summary['recent'][:500]}")
+    
+    # Feature lifecycle
+    if memory.get("feature_lifecycle"):
+        lifecycle = memory["feature_lifecycle"]
+        if lifecycle.get("struggling_features"):
+            output.append("\n⚠️  Struggling features:")
+            for feature in lifecycle["struggling_features"][-3:]:
+                output.append(f"  - {feature.get('file', 'unknown')}: {feature.get('edit_count', 0)} edits")
+                if feature.get("suggestion"):
+                    output.append(f"    Suggestion: {feature['suggestion']}")
+    
+    # Technical decisions
+    if memory.get("technical_decisions"):
+        output.append("\nRecent technical decisions:")
+        for decision in memory["technical_decisions"][-3:]:
+            output.append(f"  - {decision.get('decision', '')[:100]}")
+    
+    # Error patterns
+    if memory.get("error_patterns"):
+        output.append("\nError patterns:")
+        for error_type, count in list(memory["error_patterns"].items())[-5:]:
+            output.append(f"  - {error_type}: {count} occurrences")
+    
+    # AI insights
+    if memory.get("ai_insights"):
+        output.append("\nAI Insights:")
+        for insight in memory["ai_insights"][-3:]:
+            output.append(f"  - {insight.get('insight', '')[:150]}")
+    
+    # Recommendations
+    if memory.get("recommendations"):
+        output.append("\n📍 Active Recommendations:")
+        for rec in memory["recommendations"][:3]:
+            output.append(f"  - {rec.get('type', '')}: {rec.get('suggestion', '')}")
+    
+    return "\n".join(output)
+
+def main():
+    cwd = os.getcwd()
+    
+    # Find memory file
+    home_side_dir = Path("~/.claude/sidekick").expanduser()
+    proj_dir = home_side_dir / proj_slug(cwd)
+    memory_file = proj_dir / "memory.json"
+    
+    if not memory_file.exists():
+        print(f"No memory found for this project.")
+        print(f"Memory would be at: {memory_file}")
+        sys.exit(1)
+    
+    # Load and display memory
+    try:
+        with open(memory_file) as f:
+            memory = json.load(f)
+        
+        print(format_memory(memory))
+        
+        # Show file location
+        print(f"\n💾 Memory file: {memory_file}")
+        
+        # Check for symlink
+        symlink = Path(cwd) / ".claude" / "memory.json"
+        if symlink.exists():
+            print(f"📎 Symlink: {symlink}")
+        
+    except Exception as e:
+        print(f"Error reading memory: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

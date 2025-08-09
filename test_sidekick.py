@@ -102,12 +102,13 @@ def test_direct_api_call():
     }
     
     body = {
-        "model": "gpt-4-turbo-preview",  # Use GPT-4 Turbo as GPT-5 might not be available
-        "temperature": 0.2,
+        "model": "gpt-5",
         "messages": [
             {"role": "system", "content": "You are a code reviewer. Should the developer add tests after fixing authentication? Reply with a JSON object: {\"should_intervene\": boolean, \"score\": 0-1, \"reason\": \"brief reason\"}"},
             {"role": "user", "content": "Developer fixed auth bug but hasn't written tests yet."}
-        ]
+        ],
+        "max_completion_tokens": 10000,
+        "reasoning_effort": "high"
     }
     
     try:
