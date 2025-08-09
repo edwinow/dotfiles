@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Background worker: reads recent transcript, sanitizes, consults GPT (configurable),
-decides if a nudge is warranted, updates memory, and writes a pending feedback file.
-Global version with per-project state isolation and line-based truncation.
-
-No stdout/stderr noise. Designed to be spawned by sidekick-counter.py.
+Advanced sidekick with sophisticated memory management.
+Features:
+- Git integration (commits, branches, changes)
+- Progressive message summarization (not sampling)
+- Feature lifecycle tracking
+- 10K character memory utilization
+- Visible memory file with symlink
+- Rollback and removal suggestions
 """
 
-import os, sys, json, time, argparse, re, hashlib
+import os, sys, json, time, argparse, re, hashlib, subprocess
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 
 # Global base directory for all sidekick state
@@ -25,15 +28,15 @@ def proj_dir(cwd: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-DEFAULT_MODEL = os.environ.get("SIDEKICK_MODEL", "gpt-4-turbo-preview")  # GPT-4 Turbo for code review
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")          # required for API mode
+DEFAULT_MODEL = os.environ.get("SIDEKICK_MODEL", "gpt-5")  # Use GPT-5 with proper parameters
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 API_URL = os.environ.get("SIDEKICK_API_URL", "https://api.openai.com/v1/chat/completions")
 
-MAX_EVENTS = int(os.environ.get("SIDEKICK_MAX_EVENTS", "60"))   # last N messages to inspect
-MAX_LINES_TOTAL = int(os.environ.get("SIDEKICK_MAX_LINES_TOTAL", "1200"))  # total line cap
-MAX_BLOCK_LINES = int(os.environ.get("SIDEKICK_MAX_BLOCK_LINES", "500"))   # cap for code blocks
-THRESHOLD  = float(os.environ.get("SIDEKICK_THRESHOLD", "0")) # score gate - always show nudges
-NUDGE_TTL  = int(os.environ.get("SIDEKICK_NUDGE_TTL_SECONDS", "900"))
+# Focus on quality over quantity
+MAX_RECENT_MSGS = 50  # Only the most recent messages in detail
+MAX_LINES_TOTAL = 1500
+THRESHOLD = 0
+NUDGE_TTL = 900
 
 def load_json(path, default):
     if path.exists():
@@ -44,44 +47,257 @@ def load_json(path, default):
     return default
 
 def save_json(path, obj):
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj, indent=2))
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(obj, f, indent=2, default=str)
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def find_transcript(event, cwd):
-    """Find transcript with project-scoped fallback only"""
-    # Prefer explicit path from event
-    tp = event.get("transcript_path")
-    if tp and Path(tp).exists():
-        return Path(tp)
-    # Fallback ONLY within this project's .claude
-    proj_claude = Path(cwd) / ".claude"
-    candidates = list(proj_claude.rglob("*.jsonl")) if proj_claude.exists() else []
-    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+def get_git_context(cwd: str) -> dict:
+    """Get rich git context from the project"""
+    git_info = {
+        "branch": "unknown",
+        "recent_commits": [],
+        "uncommitted_changes": 0,
+        "last_commit_message": "",
+        "commit_frequency": "unknown"
+    }
+    
+    try:
+        # Current branch
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=cwd, capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            git_info["branch"] = result.stdout.strip()
+        
+        # Recent commits with stats
+        result = subprocess.run(
+            ["git", "log", "--oneline", "--stat", "-n", "10"],
+            cwd=cwd, capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            commits = []
+            current_commit = []
+            for line in result.stdout.splitlines():
+                if re.match(r'^[a-f0-9]{7,}', line):
+                    if current_commit:
+                        commits.append(" ".join(current_commit))
+                    current_commit = [line]
+                elif line.strip() and current_commit:
+                    # Stats line - extract key info
+                    if "files changed" in line:
+                        current_commit.append(f"({line.strip()})")
+            if current_commit:
+                commits.append(" ".join(current_commit))
+            git_info["recent_commits"] = commits[:10]
+            
+            if commits:
+                git_info["last_commit_message"] = commits[0].split(' ', 1)[1] if ' ' in commits[0] else commits[0]
+        
+        # Uncommitted changes
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd, capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            git_info["uncommitted_changes"] = len(result.stdout.splitlines())
+        
+        # Commit frequency (commits in last 7 days)
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"--since={week_ago}", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            count = int(result.stdout.strip())
+            if count > 20:
+                git_info["commit_frequency"] = "very active"
+            elif count > 10:
+                git_info["commit_frequency"] = "active"
+            elif count > 3:
+                git_info["commit_frequency"] = "moderate"
+            else:
+                git_info["commit_frequency"] = "low"
+                
+    except Exception:
+        pass  # Git operations are optional
+    
+    return git_info
+
+def get_project_context(cwd: str) -> dict:
+    """Analyze project structure and technology stack"""
+    context = {
+        "languages": [],
+        "frameworks": [],
+        "build_tools": [],
+        "test_frameworks": [],
+        "has_tests": False,
+        "project_type": "unknown"
+    }
+    
+    project_path = Path(cwd)
+    
+    # Check for common files
+    files_to_check = {
+        "package.json": ("js", "node"),
+        "requirements.txt": ("python", None),
+        "pyproject.toml": ("python", None),
+        "Cargo.toml": ("rust", None),
+        "go.mod": ("go", None),
+        "pom.xml": ("java", "maven"),
+        "build.gradle": ("java", "gradle"),
+        "composer.json": ("php", None),
+        "Gemfile": ("ruby", None),
+        ".csproj": ("csharp", None),
+        "tsconfig.json": ("typescript", None),
+        "next.config.js": ("js", "nextjs"),
+        "vite.config.js": ("js", "vite"),
+        "webpack.config.js": ("js", "webpack"),
+    }
+    
+    for file, (lang, framework) in files_to_check.items():
+        if (project_path / file).exists() or list(project_path.glob(f"**/{file}")):
+            if lang and lang not in context["languages"]:
+                context["languages"].append(lang)
+            if framework and framework not in context["frameworks"]:
+                context["frameworks"].append(framework)
+    
+    # Check for test directories
+    test_dirs = ["test", "tests", "__tests__", "spec", "test_*.py", "*_test.go"]
+    for pattern in test_dirs:
+        if list(project_path.glob(f"**/{pattern}")):
+            context["has_tests"] = True
+            break
+    
+    # Determine project type
+    if "nextjs" in context["frameworks"]:
+        context["project_type"] = "Next.js web app"
+    elif "vite" in context["frameworks"] or "webpack" in context["frameworks"]:
+        context["project_type"] = "Frontend web app"
+    elif "node" in context["languages"] and (project_path / "server.js").exists():
+        context["project_type"] = "Node.js server"
+    elif "python" in context["languages"]:
+        if (project_path / "manage.py").exists():
+            context["project_type"] = "Django app"
+        elif (project_path / "app.py").exists():
+            context["project_type"] = "Flask/Python app"
+        else:
+            context["project_type"] = "Python project"
+    
+    return context
+
+def summarize_messages(messages: list, max_chars: int = 2000) -> str:
+    """Create a smart summary of messages focusing on key information"""
+    if not messages:
+        return ""
+    
+    summary_parts = []
+    
+    # Group messages by role and extract key patterns
+    user_intents = []
+    assistant_actions = []
+    errors_encountered = []
+    files_modified = []
+    tests_written = False
+    
+    for msg in messages:
+        text = msg.get("text", "")
+        role = msg.get("role", "")
+        tools = msg.get("tools", [])
+        
+        # Extract user intent
+        if role == "user" and len(text) < 200:
+            user_intents.append(text[:100])
+        
+        # Track assistant actions
+        if role == "assistant":
+            if "Edit" in tools or "Write" in tools or "MultiEdit" in tools:
+                # Extract file paths
+                file_matches = re.findall(r'["\']([^"\']*\.[a-z]+)["\']', text)
+                files_modified.extend(file_matches[:3])
+                
+            if "test" in text.lower():
+                tests_written = True
+                
+        # Track errors
+        if "error" in text.lower() or "failed" in text.lower():
+            error_snippet = text[:150]
+            if error_snippet not in errors_encountered:
+                errors_encountered.append(error_snippet)
+    
+    # Build structured summary
+    if user_intents:
+        summary_parts.append(f"User requests: {'; '.join(user_intents[-5:])}")
+    
+    if files_modified:
+        unique_files = list(dict.fromkeys(files_modified))  # Remove duplicates
+        summary_parts.append(f"Files modified: {', '.join(unique_files[-10:])}")
+    
+    if errors_encountered:
+        summary_parts.append(f"Errors: {'; '.join(errors_encountered[-3:])}")
+    
+    if tests_written:
+        summary_parts.append("Tests were written/modified")
+    
+    # Add activity summary
+    tool_usage = {}
+    for msg in messages:
+        for tool in msg.get("tools", []):
+            tool_usage[tool] = tool_usage.get(tool, 0) + 1
+    
+    if tool_usage:
+        top_tools = sorted(tool_usage.items(), key=lambda x: x[1], reverse=True)[:5]
+        summary_parts.append(f"Tools used: {', '.join([f'{t}({c})' for t, c in top_tools])}")
+    
+    summary = "\n".join(summary_parts)
+    if len(summary) > max_chars:
+        summary = summary[:max_chars-3] + "..."
+    
+    return summary
+
+def create_memory_symlink(cwd: str, memory_file: Path):
+    """Create a visible symlink to memory in project .claude directory"""
+    claude_dir = Path(cwd) / ".claude"
+    if claude_dir.exists():
+        symlink_path = claude_dir / "memory.json"
+        try:
+            if symlink_path.exists() or symlink_path.is_symlink():
+                symlink_path.unlink()
+            symlink_path.symlink_to(memory_file)
+        except Exception:
+            pass  # Symlink creation is optional
 
 def read_messages_since(transcript_path: Path, last_ts: str | None):
+    """Read messages and extract structured information"""
     msgs = []
+    feature_changes = []
+    
     if not transcript_path or not transcript_path.exists():
-        return msgs
+        return msgs, feature_changes
+        
     with transcript_path.open() as f:
         for line in f:
             try:
                 entry = json.loads(line)
             except Exception:
                 continue
+            
             ts = entry.get("timestamp","")
             if last_ts and ts and ts <= last_ts:
                 continue
-            if entry.get("type") in ("user","assistant","system") and "message" in entry:
+                
+            if entry.get("type") in ("user","assistant") and "message" in entry:
                 msg = entry["message"]
                 role = msg.get("role", entry["type"])
                 content = msg.get("content", "")
-                # flatten structured content
+                
+                # Process content
                 text_parts = []
                 tools = []
+                
                 if isinstance(content, list):
                     for c in content:
                         t = c.get("type")
@@ -90,127 +306,268 @@ def read_messages_since(transcript_path: Path, last_ts: str | None):
                         elif t == "tool_use":
                             name = c.get("name","")
                             tools.append(name)
-                            # keep only key params
                             inp = c.get("input",{})
-                            snip = json.dumps({k:inp.get(k) for k in ("command","file_path","paths","query") if k in inp}, ensure_ascii=False)
-                            text_parts.append(f"[TOOL USE {name}] {snip}")
+                            
+                            # Track feature changes
+                            if name in ["Write", "Edit", "MultiEdit"]:
+                                file_path = inp.get("file_path", "")
+                                # Check if text_parts has content before accessing
+                                if text_parts and len(text_parts) > 0:
+                                    last_text = text_parts[-1].lower()
+                                    if "add" in last_text or "implement" in last_text:
+                                        feature_changes.append({
+                                            "type": "addition",
+                                            "file": file_path,
+                                            "timestamp": ts
+                                        })
+                                    elif "remove" in last_text or "delete" in last_text:
+                                        feature_changes.append({
+                                            "type": "removal",
+                                            "file": file_path,
+                                            "timestamp": ts
+                                        })
+                            
+                            # Compact representation
+                            if name in ["Edit", "Write", "MultiEdit"]:
+                                text_parts.append(f"[{name}: {inp.get('file_path', 'unknown')}]")
+                            else:
+                                text_parts.append(f"[{name}]")
+                                
                         elif t == "tool_result":
-                            out = c.get("output","")
-                            # keep first 40 lines
-                            lines = out.splitlines()
-                            out = "\n".join(lines[:40])
-                            text_parts.append(f"[TOOL RESULT] {out}")
+                            content_raw = c.get("content","")
+                            # Content might be a list or string
+                            if isinstance(content_raw, list):
+                                out = str(content_raw)[:1000]  # Increased for more context
+                            else:
+                                out = str(content_raw)[:1000]  # Increased for more context
+                            if "error" in out.lower():
+                                text_parts.append(f"[ERROR: {out[:500]}]")  # More context for errors
+                                
                 elif isinstance(content, str):
                     text_parts.append(content)
+                    
                 text = "\n".join(text_parts).strip()
                 if text:
-                    msgs.append({"role": role, "text": text, "timestamp": ts, "tools": tools})
-    return msgs
-
-def truncate_block_lines(text: str, max_lines: int) -> str:
-    """Truncate text to max lines"""
-    lines = text.splitlines()
-    if len(lines) <= max_lines:
-        return text
-    return "\n".join(lines[:max_lines]) + f"\n... [truncated {len(lines)-max_lines} lines]"
-
-def sanitize(messages):
-    """
-    Keep only useful signals with line-based truncation.
-    """
-    cleaned_chunks = []
-    for m in messages[-MAX_EVENTS:]:
-        txt = m["text"]
-        # strip obvious noise
-        txt = re.sub(r'(?i)\b(uuid|request_id|trace_id)\b[:=]\s*[a-f0-9-]+', '', txt)
-        txt = re.sub(r'\x1b\[[0-9;]*m', '', txt)  # ANSI
-        
-        # truncate any ``` blocks by lines
-        def _trim_block(match):
-            block = match.group(0)
-            head = block[:3]  # ```
-            body = block[3:-3] if len(block) > 6 else ""
-            tail = block[-3:] if len(block) > 6 else ""
-            body_trim = truncate_block_lines(body, MAX_BLOCK_LINES)
-            return head + body_trim + tail
-        
-        txt = re.sub(r"```[\s\S]*?```", _trim_block, txt)
-        
-        # tool_result already limited to 40 lines upstream
-        cleaned_chunks.append(f"{m['role'].upper()} @ {m.get('timestamp','')}\n{txt}\n")
-
-    # global line cap
-    all_text = ("\n" + ("-"*60) + "\n").join(cleaned_chunks)
-    lines = all_text.splitlines()
-    if len(lines) > MAX_LINES_TOTAL:
-        all_text = "\n".join(lines[:MAX_LINES_TOTAL]) + f"\n... [truncated {len(lines)-MAX_LINES_TOTAL} lines]"
+                    msgs.append({
+                        "role": role,
+                        "text": text,
+                        "timestamp": ts,
+                        "tools": tools
+                    })
     
-    return all_text
+    return msgs, feature_changes
 
-def read_project_policy(cwd: str):
-    # Pull the pnpm rules + project overview from your CLAUDE.md if present
-    md_path = Path(cwd) / "CLAUDE.md"
-    if not md_path.exists():
-        md_path = Path(cwd) / ".claude" / "CLAUDE.md"
-    if not md_path.exists():
-        return ""
-    text = md_path.read_text(encoding="utf-8", errors="ignore")
-    # Keep the PNPM section + short overview
-    keep = []
-    capture = False
-    for line in text.splitlines():
-        if line.strip().startswith("## ") and "Package Manager" in line:
-            capture = True
-        if line.startswith("## ") and capture and "Package Manager" not in line:
-            # stop after that section
-            capture = False
-        if capture:
-            keep.append(line)
-    # Always add one-sentence project fingerprint to guide the reviewer
-    keep.append("\nProject fingerprint: Next.js 15, strict TS, Tailwind v4, pnpm-only.\n")
-    return "\n".join(keep).strip()
+def build_rich_memory(memory: dict, new_messages: list, feature_changes: list, 
+                      git_context: dict, project_context: dict) -> dict:
+    """Build a comprehensive memory structure optimized for signal"""
+    
+    # Update session tracking
+    memory["sessions"] = memory.get("sessions", 0) + 1
+    memory["last_updated"] = now_iso()
+    
+    # 1. Project Context (static, updated occasionally)
+    if not memory.get("project_context") or memory["sessions"] % 10 == 0:
+        memory["project_context"] = project_context
+    
+    # 2. Git Context (dynamic, updated each time)
+    memory["git_context"] = git_context
+    
+    # 3. Progressive Conversation Summary (10K chars available!)
+    if not memory.get("conversation_summary"):
+        memory["conversation_summary"] = {
+            "recent": "",      # Last session
+            "rolling": "",     # Last 5 sessions
+            "historical": ""   # All time
+        }
+    
+    # Summarize new messages
+    new_summary = summarize_messages(new_messages, max_chars=1500)
+    
+    # Update conversation summaries with cascading
+    memory["conversation_summary"]["recent"] = new_summary
+    
+    # Rolling summary combines last few recents
+    rolling = memory["conversation_summary"].get("rolling", "")
+    rolling = f"Session {memory['sessions']}: {new_summary}\n{rolling}"[:3000]
+    memory["conversation_summary"]["rolling"] = rolling
+    
+    # Historical gets key points from rolling
+    if memory["sessions"] % 5 == 0 and rolling:
+        historical = memory["conversation_summary"].get("historical", "")
+        key_points = extract_key_points(rolling)
+        historical = f"{key_points}\n{historical}"[:2000]
+        memory["conversation_summary"]["historical"] = historical
+    
+    # 4. Feature Lifecycle Tracking
+    if not memory.get("feature_lifecycle"):
+        memory["feature_lifecycle"] = {
+            "active_features": [],
+            "completed_features": [],
+            "struggling_features": [],
+            "removed_features": []
+        }
+    
+    # Process feature changes
+    for change in feature_changes:
+        feature_id = f"{change['file']}_{change['timestamp'][:10]}"
+        if change["type"] == "addition":
+            memory["feature_lifecycle"]["active_features"].append({
+                "id": feature_id,
+                "file": change["file"],
+                "started": change["timestamp"],
+                "iterations": 1
+            })
+        elif change["type"] == "removal":
+            memory["feature_lifecycle"]["removed_features"].append({
+                "id": feature_id,
+                "file": change["file"],
+                "removed": change["timestamp"]
+            })
+    
+    # Identify struggling features (edited many times)
+    edit_counts = {}
+    for msg in new_messages:
+        for tool in msg.get("tools", []):
+            if tool in ["Edit", "MultiEdit"]:
+                file_match = re.search(r'([^/\\]+\.[a-z]+)', msg["text"])
+                if file_match:
+                    file = file_match.group(1)
+                    edit_counts[file] = edit_counts.get(file, 0) + 1
+    
+    for file, count in edit_counts.items():
+        if count > 5:  # Edited more than 5 times
+            memory["feature_lifecycle"]["struggling_features"].append({
+                "file": file,
+                "edit_count": count,
+                "session": memory["sessions"],
+                "suggestion": f"Consider reverting changes to {file} and trying a different approach"
+            })
+    
+    # Keep lists bounded
+    for key in ["active_features", "completed_features", "struggling_features", "removed_features"]:
+        memory["feature_lifecycle"][key] = memory["feature_lifecycle"][key][-20:]
+    
+    # 5. Technical Decisions and Patterns
+    if not memory.get("technical_decisions"):
+        memory["technical_decisions"] = []
+    
+    # Extract technical decisions from messages
+    for msg in new_messages:
+        text = msg["text"].lower()
+        if any(keyword in text for keyword in ["decided", "chose", "using", "switched to", "migrated"]):
+            if len(msg["text"]) < 300:
+                memory["technical_decisions"].append({
+                    "decision": msg["text"][:200],
+                    "timestamp": msg["timestamp"],
+                    "session": memory["sessions"]
+                })
+    
+    memory["technical_decisions"] = memory["technical_decisions"][-30:]
+    
+    # 6. Error Patterns and Solutions
+    if not memory.get("error_patterns"):
+        memory["error_patterns"] = {}
+    
+    for msg in new_messages:
+        if "error" in msg["text"].lower():
+            error_type = "unknown"
+            if "typescript" in msg["text"].lower() or "type error" in msg["text"].lower():
+                error_type = "typescript"
+            elif "import" in msg["text"].lower():
+                error_type = "import"
+            elif "undefined" in msg["text"].lower() or "null" in msg["text"].lower():
+                error_type = "null_reference"
+            
+            memory["error_patterns"][error_type] = memory["error_patterns"].get(error_type, 0) + 1
+    
+    # 7. Recommendations for rollback
+    memory["recommendations"] = []
+    
+    # Check if we should recommend rollback
+    if memory["feature_lifecycle"]["struggling_features"]:
+        latest_struggle = memory["feature_lifecycle"]["struggling_features"][-1]
+        if git_context["recent_commits"]:
+            memory["recommendations"].append({
+                "type": "rollback",
+                "reason": f"File {latest_struggle['file']} edited {latest_struggle['edit_count']} times",
+                "suggestion": f"git reset --soft HEAD~1 to undo last commit and try different approach",
+                "confidence": 0.7
+            })
+    
+    # Check if tests are needed
+    if project_context.get("has_tests") == False and memory["sessions"] > 5:
+        memory["recommendations"].append({
+            "type": "testing",
+            "reason": "No test directory found after multiple sessions",
+            "suggestion": "Initialize test framework: pnpm add -D jest @types/jest",
+            "confidence": 0.9
+        })
+    
+    return memory
 
-def call_openai(model: str, system_prompt: str, user_payload: str, timeout=40):
+def extract_key_points(text: str, max_points: int = 5) -> str:
+    """Extract key points from text - simple heuristic version"""
+    lines = text.split('\n')
+    key_lines = []
+    
+    keywords = ["error", "fixed", "implemented", "added", "removed", "bug", "feature", 
+                "refactor", "test", "deploy", "security", "performance"]
+    
+    for line in lines:
+        if any(keyword in line.lower() for keyword in keywords):
+            key_lines.append(line[:150])
+            if len(key_lines) >= max_points:
+                break
+    
+    return "\n".join(key_lines)
+
+def call_openai(model: str, system_prompt: str, user_payload: str, timeout=120):  # Increased timeout for GPT-5
     if not OPENAI_API_KEY:
-        # Log to a file so user knows why nudges aren't appearing
-        log_path = HOME_SIDE_DIR / "api_key_missing.log"
-        log_path.write_text(f"API key missing at {now_iso()}\nSet OPENAI_API_KEY environment variable\n")
-        raise RuntimeError("OPENAI_API_KEY not set for sidekick-review-worker")
+        raise RuntimeError("OPENAI_API_KEY not set")
+    
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": model,
-        "temperature": 0.2,
-        "messages": [
-            {"role":"system","content": system_prompt},
-            {"role":"user","content": user_payload}
-        ]
-    }
+    
+    if "gpt-5" in model:
+        body = {
+            "model": model,
+            "messages": [
+                {"role":"system","content": system_prompt},
+                {"role":"user","content": user_payload}
+            ],
+            "max_completion_tokens": 10000,
+            "reasoning_effort": "high"
+        }
+    else:
+        body = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {"role":"system","content": system_prompt},
+                {"role":"user","content": user_payload}
+            ]
+        }
+    
     r = requests.post(API_URL, headers=headers, json=body, timeout=timeout)
     r.raise_for_status()
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    return content
+    return r.json()["choices"][0]["message"]["content"]
 
 SCHEMA_HINT = """
-Return ONLY compact JSON (no markdown) with this schema:
 {
   "should_intervene": boolean,
-  "score": number,            // 0..1 confidence that the nudge is useful
-  "reason": string,           // <120 chars
-  "nudge_markdown": string,   // actionable, <= 700 chars, include copy/paste commands in ```bash
-  "commands": string[],       // 0..5 raw commands (no comments)
-  "memory_update": string|null // <300 chars summary to append to long-term memory if helpful
+  "score": number (0-1),
+  "reason": string (<120 chars),
+  "nudge_markdown": string (<1000 chars with specific commands),
+  "commands": string[] (0-5 executable commands),
+  "memory_insights": string (key observations about patterns),
+  "feature_recommendations": {
+    "continue": string[],
+    "reconsider": string[],
+    "rollback": string[]
+  }
 }
 """
 
-SYSTEM_PROMPT = """You are an expert code reviewer with deep reasoning capabilities, observing a developer using Claude Code.
-Use your enhanced reasoning to identify subtle patterns, potential issues, and non-obvious improvements.
-Intervene when you detect: repeated patterns indicating confusion, missing tests after risky changes,
-policy violations (pnpm-only, Next.js 15, strict TypeScript), security/performance issues, architectural concerns,
-or when you can suggest a significantly better approach the developer might be missing.
-Be precise, actionable, and provide copy-pasteable solutions. Never suggest bun; always use pnpm.
-Leverage the full context to understand the developer's intent and provide insightful guidance.
-If nothing valuable to add, set should_intervene=false and a low score."""
+SYSTEM_PROMPT = """You are an architectural sidekick with project memory. Track patterns, suggest rollbacks for struggling features, prevent repeated mistakes. Respond with JSON only matching the schema."""
 
 def main():
     ap = argparse.ArgumentParser()
@@ -220,95 +577,161 @@ def main():
     try:
         event_path = Path(args.event_file)
         event = json.loads(event_path.read_text())
-        # Clean up temp file immediately after reading
-        try:
-            event_path.unlink()
-        except:
-            pass
+        event_path.unlink()
     except Exception:
-        return  # silent fail
+        return
 
     cwd = event.get("cwd", os.getcwd())
+    
+    # Simple debug logging
+    debug_file = proj_dir(cwd) / "debug.log"
+    with open(debug_file, "a") as f:
+        f.write(f"\n[{now_iso()}] Worker started for {cwd}\n")
     
     # Per-project state files
     P_DIR = proj_dir(cwd)
     MEMORY_FILE = P_DIR / "memory.json"
     PENDING_FILE = P_DIR / "pending_feedback.json"
     
-    transcript = find_transcript(event, cwd)
-    memory = load_json(MEMORY_FILE, {"last_timestamp": None, "long_term_summary": "", "last_nudge_hash": ""})
-
-    msgs = read_messages_since(transcript, memory.get("last_timestamp"))
+    # Load memory
+    memory = load_json(MEMORY_FILE, {
+        "last_timestamp": None,
+        "sessions": 0,
+        "project_context": {},
+        "conversation_summary": {},
+        "feature_lifecycle": {},
+        "technical_decisions": [],
+        "error_patterns": {},
+        "recommendations": []
+    })
+    
+    # Get git and project context
+    git_context = get_git_context(cwd)
+    project_context = get_project_context(cwd)
+    
+    # Read new messages
+    transcript = event.get("transcript_path")
+    if transcript:
+        transcript = Path(transcript)
+    else:
+        # Find latest transcript in Claude Code's central projects directory
+        # Claude stores transcripts in ~/.claude/projects/[project-slug]/[session-id].jsonl
+        
+        # Calculate project slug - Claude replaces special chars with dashes
+        # Examples: /home/edwin/.claude -> -home-edwin--claude
+        #           /mnt/c/Users/ASUS/Desktop/todo -> -mnt-c-Users-ASUS-Desktop-todo
+        project_slug = cwd.replace('/', '-').replace('.', '-')
+        if project_slug.startswith('-'):
+            pass  # Keep the leading dash
+        else:
+            project_slug = '-' + project_slug  # Add leading dash if missing
+        
+        # Look in the central projects directory
+        projects_dir = Path.home() / ".claude/projects" / project_slug
+        
+        if projects_dir.exists():
+            candidates = list(projects_dir.glob("*.jsonl"))
+            if candidates:
+                # Get the most recent transcript
+                transcript = max(candidates, key=lambda p: p.stat().st_mtime)
+                with open(debug_file, "a") as f:
+                    f.write(f"  Selected transcript: {transcript.name}\n")
+    
+    if not transcript:
+        return
+    
+    msgs, feature_changes = read_messages_since(transcript, memory.get("last_timestamp"))
     if not msgs:
         return
-
-    sanitized = sanitize(msgs)
-    policy = read_project_policy(cwd)
-
-    # Build user payload (small and structured)
+    
+    # Build rich memory structure
+    memory = build_rich_memory(memory, msgs, feature_changes, git_context, project_context)
+    
+    # Create visible symlink
+    create_memory_symlink(cwd, MEMORY_FILE)
+    
+    # Prepare GPT-5 payload with rich context (using our 10K budget wisely)
+    recent_messages = "\n---\n".join([f"{m['role']}: {m['text'][:200]}" for m in msgs[-30:]])
+    
     payload = {
-        "context": {
-            "project_policy": policy,
-            "long_term_summary": memory.get("long_term_summary","")[:2000],
-            "recent_events": sanitized
+        "memory": {
+            "sessions_count": memory["sessions"],
+            "project_type": memory["project_context"].get("project_type", "unknown"),
+            "languages": memory["project_context"].get("languages", []),
+            "has_tests": memory["project_context"].get("has_tests", False),
+            "git_branch": git_context["branch"],
+            "recent_commits": git_context["recent_commits"][:5],
+            "uncommitted_changes": git_context["uncommitted_changes"],
+            "conversation_summary": memory["conversation_summary"],
+            "struggling_features": memory["feature_lifecycle"].get("struggling_features", [])[-3:],
+            "recent_technical_decisions": memory["technical_decisions"][-5:],
+            "error_patterns": dict(list(memory["error_patterns"].items())[-5:]),
+            "active_recommendations": memory["recommendations"][:3]
         },
+        "recent_activity": recent_messages,
         "request": {
-            "goal": "Detect if the developer would benefit from a brief, actionable nudge right now.",
-            "house_rules": ["pnpm-only", "Next.js 15", "strict TS"],
-            "output": "JSON",
-            "schema": "see SCHEMA below"
+            "analyze": "Review the memory and recent activity",
+            "consider": "Should you intervene with strategic guidance?",
+            "focus": "Rollbacks, architectural issues, repeated patterns",
+            "output": "JSON only"
         },
-        "SCHEMA": SCHEMA_HINT.strip()
+        "schema": SCHEMA_HINT
     }
+    
     user_payload = json.dumps(payload, ensure_ascii=False)
-
-    # Call model
+    
+    # Call GPT-5
     try:
         raw = call_openai(DEFAULT_MODEL, SYSTEM_PROMPT, user_payload)
     except Exception:
         return
-
-    # Extract JSON robustly (allowing models that wrap it in backticks)
-    m = re.search(r'\{[\s\S]*\}\s*$', raw.strip())
-    text = m.group(0) if m else raw.strip()
+    
+    # Parse response
+    m = re.search(r'\{[\s\S]*\}', raw.strip())
+    if not m:
+        return
+        
     try:
-        out = json.loads(text)
+        result = json.loads(m.group(0))
     except Exception:
         return
-
-    should = bool(out.get("should_intervene"))
-    score = float(out.get("score", 0.0))
-    nudge = (out.get("nudge_markdown") or "").strip()
-    cmds  = out.get("commands") or []
-    memup = (out.get("memory_update") or "").strip()
-
-    # De-dupe: avoid repeating the exact same nudge
-    nudge_hash = hashlib.sha256(nudge.encode("utf-8")).hexdigest() if nudge else ""
-
-    # Update memory
-    lt = memory.get("long_term_summary","")
-    if memup:
-        lt = (lt + "\n" + memup).strip()[:4000]  # cap
-        memory["long_term_summary"] = lt
-
-    # Advance the pointer to the last processed timestamp
-    last_ts = msgs[-1].get("timestamp") or memory.get("last_timestamp")
-    memory["last_timestamp"] = last_ts
+    
+    # Update memory with insights
+    if result.get("memory_insights"):
+        memory["ai_insights"] = memory.get("ai_insights", [])
+        memory["ai_insights"].append({
+            "timestamp": now_iso(),
+            "insight": result["memory_insights"],
+            "session": memory["sessions"]
+        })
+        memory["ai_insights"] = memory["ai_insights"][-20:]
+    
+    # Track feature recommendations
+    if result.get("feature_recommendations"):
+        for feature in result["feature_recommendations"].get("rollback", []):
+            memory["feature_lifecycle"]["struggling_features"].append({
+                "feature": feature,
+                "ai_suggested_rollback": True,
+                "session": memory["sessions"]
+            })
+    
+    # Save enhanced memory
+    memory["last_timestamp"] = msgs[-1]["timestamp"] if msgs else memory.get("last_timestamp")
     save_json(MEMORY_FILE, memory)
-
-    # Gate + write pending nudge
-    if should and score >= THRESHOLD and nudge and nudge_hash != memory.get("last_nudge_hash"):
-        payload = {
+    
+    # Always write nudge (no should_intervene check)
+    if result.get("score", 0) >= THRESHOLD:
+        nudge_data = {
             "created_at": now_iso(),
             "ttl_seconds": NUDGE_TTL,
-            "nudge_markdown": nudge,
-            "commands": cmds,
-            "score": score,
-            "reason": out.get("reason","")
+            "nudge_markdown": result.get("nudge_markdown", ""),
+            "commands": result.get("commands", []),
+            "score": result.get("score", 0),
+            "reason": result.get("reason", ""),
+            "context": f"Session {memory['sessions']}, Branch: {git_context['branch']}, {len(msgs)} new messages",
+            "memory_based": True
         }
-        save_json(PENDING_FILE, payload)
-        memory["last_nudge_hash"] = nudge_hash
-        save_json(MEMORY_FILE, memory)
+        save_json(PENDING_FILE, nudge_data)
 
 if __name__ == "__main__":
     main()
